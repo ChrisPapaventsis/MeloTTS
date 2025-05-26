@@ -1,3 +1,5 @@
+This app was tested on MacOS Sonoma 14.4 and Python 3.9
+
 **Citation**
 ```
 @software{zhao2024melo,
