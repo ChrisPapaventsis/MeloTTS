@@ -9,3 +9,7 @@ build/
 
 *.zip
 *.wav
+
+myenv/
+.DS_Store
+Thumbs.db

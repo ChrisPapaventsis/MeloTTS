@@ -10,7 +10,7 @@ import os
 @click.option('--language', '-l', default='EN', help='Language, defaults to English', type=click.Choice(['EN', 'ES', 'FR', 'ZH', 'JP', 'KR'], case_sensitive=False))
 @click.option('--speaker', '-spk', default='EN-Default', help='Speaker ID, only for English, leave empty for default, ignored if not English. If English, defaults to "EN-Default"', type=click.Choice(['EN-Default', 'EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU']))
 @click.option('--speed', '-s', default=1.0, help='Speed, defaults to 1.0', type=float)
-@click.option('--device', '-d', default='auto', help='Device, defaults to auto')
+@click.option('--device', '-d', default='cpu', help='Device, defaults to cpu')
 def main(text, file, output_path, language, speaker, speed, device):
     if file:
         if not os.path.exists(text):

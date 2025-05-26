@@ -20,7 +20,7 @@ from .download_utils import load_or_download_config, load_or_download_model
 class TTS(nn.Module):
     def __init__(self, 
                 language,
-                device='auto',
+                device='cpu',
                 use_hf=True,
                 config_path=None,
                 ckpt_path=None):
