@@ -30,6 +30,7 @@ import queue
 import sounddevice as sd
 from melo.api import TTS
 import time
+import soundfile as sf
 
 # Suppress all logging output
 logging.getLogger().setLevel(logging.ERROR)
@@ -272,14 +273,6 @@ class CustomProgressBar(ProgressBar):
     def set_buffer_value(self, value):
         Animation(buffer_value=value, duration=0.3).start(self)
 
-class PlaybackButton(RoundedButton):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.size_hint = (None, None)
-        self.width = dp(70)
-        self.height = dp(70)
-        self.font_size = '14sp'
-
 class AudioProgressBar(CustomProgressBar):
     sound = ObjectProperty(None)
     _update_event = ObjectProperty(None)
@@ -500,9 +493,11 @@ class MeloTTSUI(BoxLayout):
     current_sentence_index = NumericProperty(0)
     total_sentences = NumericProperty(0)
     current_channel = 0
+    should_stop = False  # Flag to signal threads to stop
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.should_stop = False
         
         # Set minimum window size and default size
         Window.minimum_width = dp(400)
@@ -680,35 +675,6 @@ class MeloTTSUI(BoxLayout):
         self.synthesize_btn.bind(on_press=self.synthesize_audio)
         main_layout.add_widget(self.synthesize_btn)
 
-        # Audio controls
-        controls_box = BoxLayout(
-            orientation='horizontal',
-            size_hint_y=None,
-            height=dp(80),
-            spacing=dp(15)
-        )
-
-        self.backward_btn = PlaybackButton(
-            text='<<',
-            on_press=self.seek_backward
-        )
-        self.play_pause_btn = PlaybackButton(
-            text='Play',
-            on_press=self.toggle_playback
-        )
-        self.forward_btn = PlaybackButton(
-            text='>>',
-            on_press=self.seek_forward
-        )
-
-        controls_box.add_widget(Widget())
-        controls_box.add_widget(self.backward_btn)
-        controls_box.add_widget(self.play_pause_btn)
-        controls_box.add_widget(self.forward_btn)
-        controls_box.add_widget(Widget())
-
-        main_layout.add_widget(controls_box)
-
         # Progress bar and time labels
         progress_box = BoxLayout(
             orientation='vertical',
@@ -785,11 +751,22 @@ class MeloTTSUI(BoxLayout):
             
         try:
             if self.is_playing:
-                # Calculate total position including all previous chunks
-                current_pos = pygame.mixer.music.get_pos() / 1000.0
-                if current_pos >= 0:
+                current_channel = pygame.mixer.Channel(self.current_channel)
+                if current_channel.get_busy():
+                    # Calculate total position including all previous chunks
                     total_pos = sum(pygame.mixer.Sound(f).get_length() 
                                   for f in self.temp_files[:self.current_sentence_index])
+                    
+                    # Add current chunk position based on current sound length and busy state
+                    current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
+                    current_length = current_sound.get_length()
+                    
+                    # Estimate current position based on time elapsed since playback started
+                    if not hasattr(self, 'playback_start_time'):
+                        self.playback_start_time = time.time()
+                    elapsed = time.time() - self.playback_start_time
+                    current_pos = min(elapsed, current_length)
+                    
                     total_pos += current_pos
                     
                     # Calculate total duration
@@ -807,140 +784,117 @@ class MeloTTSUI(BoxLayout):
             
     def update_time_labels(self, dt):
         if self.is_playing:
-            current = pygame.mixer.music.get_pos() / 1000.0
-            self.current_time.text = self.format_time(current)
-            self.total_time.text = self.format_time(self.sound_length)
+            current_channel = pygame.mixer.Channel(self.current_channel)
+            if current_channel.get_busy():
+                # Calculate total position including all previous chunks
+                total_pos = sum(pygame.mixer.Sound(f).get_length() 
+                              for f in self.temp_files[:self.current_sentence_index])
+                
+                # Add current chunk position based on time elapsed
+                if hasattr(self, 'playback_start_time'):
+                    elapsed = time.time() - self.playback_start_time
+                    current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
+                    current_pos = min(elapsed, current_sound.get_length())
+                    total_pos += current_pos
+                
+                self.current_time.text = self.format_time(total_pos)
+                
+                total_duration = sum(pygame.mixer.Sound(f).get_length() 
+                                  for f in self.temp_files)
+                self.total_time.text = self.format_time(total_duration)
 
-    def seek_to_position(self, position):
-        """Seek to a specific position in the audio"""
-        if not self.temp_files:
-            return
-
-        try:
-            # Find the appropriate chunk for the target position
-            total_duration = 0
-            target_chunk = 0
-            chunk_start_times = [0]  # Start time of each chunk
-            
-            # Calculate duration of each chunk and find target chunk
-            for i, temp_file in enumerate(self.temp_files):
-                sound = pygame.mixer.Sound(temp_file)
-                duration = sound.get_length()
-                total_duration += duration
-                if i < len(self.temp_files) - 1:
-                    chunk_start_times.append(total_duration)
-            
-            # Find which chunk contains our target position
-            for i, start_time in enumerate(chunk_start_times):
-                if start_time <= position < (chunk_start_times[i + 1] if i + 1 < len(chunk_start_times) else total_duration):
-                    target_chunk = i
-                    break
-            
-            # If seeking beyond processed chunks, go to last completed chunk
-            if target_chunk >= len(self.temp_files):
-                target_chunk = len(self.temp_files) - 1
-                position = chunk_start_times[target_chunk]
-            
-            # Calculate position within the chunk
-            chunk_position = position - chunk_start_times[target_chunk]
-            
-            # Update playback state
-            was_playing = self.is_playing
-            if was_playing:
-                pygame.mixer.pause()
-            
-            # Load and seek to position in target chunk
-            self.current_sentence_index = target_chunk
-            sound = pygame.mixer.Sound(self.temp_files[target_chunk])
-            channel = pygame.mixer.Channel(self.current_channel)
-            channel.play(sound)
-            
-            # Seek within the chunk
-            pygame.mixer.music.set_pos(chunk_position)
-            
-            if not was_playing:
-                pygame.mixer.pause()
-            else:
-                self.is_playing = True
-                self.play_pause_btn.text = 'Pause'
-            
-            # Update UI
-            self.progress_bar.value = (position / total_duration) * 100 if total_duration > 0 else 0
-            self.current_time.text = self.format_time(position)
-            self.total_time.text = self.format_time(total_duration)
-            
-        except Exception as e:
-            print(f"Error seeking: {e}")
-            self.status_label.text = 'Seek error'
-
-    def seek_forward(self, instance):
+    def start_playback(self):
+        """Start playing the first available sentence"""
         if not self.temp_files:
             return
             
-        try:
-            current_pos = pygame.mixer.music.get_pos() / 1000.0
-            if current_pos < 0:
-                current_pos = 0
-                
-            # Add the current chunk's start time
-            current_pos += sum(pygame.mixer.Sound(f).get_length() 
-                             for f in self.temp_files[:self.current_sentence_index])
+        # Stop any currently playing audio on both channels
+        pygame.mixer.Channel(self.current_channel).stop()
+        pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
             
-            # Seek 5 seconds forward
-            new_pos = current_pos + 5
-            self.seek_to_position(new_pos)
-            
-        except Exception as e:
-            print(f"Error seeking forward: {e}")
-            self.status_label.text = 'Seek error'
+        self.is_playing = True
+        self.status_label.text = 'Playing'
+        
+        # Reset playback start time
+        self.playback_start_time = time.time()
+        
+        # Start playing from the current sentence
+        self.play_next_sentence()
+        
+        # Start the background playback checker
+        Clock.schedule_interval(self.check_playback, 0.1)
 
-    def seek_backward(self, instance):
-        if not self.temp_files:
-            return
-            
-        try:
-            current_pos = pygame.mixer.music.get_pos() / 1000.0
-            if current_pos < 0:
-                current_pos = 0
-                
-            # Add the current chunk's start time
-            current_pos += sum(pygame.mixer.Sound(f).get_length() 
-                             for f in self.temp_files[:self.current_sentence_index])
-            
-            # Seek 5 seconds backward
-            new_pos = max(0, current_pos - 5)
-            self.seek_to_position(new_pos)
-            
-        except Exception as e:
-            print(f"Error seeking backward: {e}")
-            self.status_label.text = 'Seek error'
-
-    def toggle_playback(self, instance):
-        if not self.temp_files:
-            return
-
-        try:
-            if self.is_playing:
-                pygame.mixer.pause()
-                self.play_pause_btn.text = 'Play'
-                self.is_playing = False
-            else:
-                self.is_playing = True
-                self.play_pause_btn.text = 'Pause'
-                
-                # If we're at the end, start from beginning
-                if self.current_sentence_index >= len(self.temp_files):
-                    self.current_sentence_index = 0
-                
-                # Resume from current position
-                pygame.mixer.unpause()
-                if not pygame.mixer.get_busy():
-                    self.play_next_sentence()
-                    
-        except Exception as e:
-            print(f"Error toggling playback: {e}")
-            self.status_label.text = 'Playback error'
+    def play_next_sentence(self):
+        """Play the next sentence in the queue"""
+        if not self.temp_files or self.current_sentence_index >= len(self.temp_files):
+            # Reset playback state when we reach the end
             self.is_playing = False
+            self.current_sentence_index = 0
+            return
+
+        try:
+            # Stop any currently playing audio on both channels
+            pygame.mixer.Channel(self.current_channel).stop()
+            pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
+            
+            # Load and play the current sentence
+            current_channel = pygame.mixer.Channel(self.current_channel)
+            current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
+            current_channel.play(current_sound)
+            
+            # Reset playback start time
+            self.playback_start_time = time.time()
+            
+            # Pre-load next sentence but don't queue it
+            next_index = self.current_sentence_index + 1
+            if next_index < len(self.temp_files):
+                # Just load the next sound into memory
+                pygame.mixer.Sound(self.temp_files[next_index])
+                
+        except Exception as e:
+            print(f"Error playing sentence: {str(e)}")
+
+    def check_playback(self, dt):
+        """Check playback status and queue next sentence if needed"""
+        if not self.is_playing:
+            return False
+            
+        current_channel = pygame.mixer.Channel(self.current_channel)
+        
+        # If current sentence is done and we have more in queue
+        if not current_channel.get_busy() and self.current_sentence_index < len(self.temp_files) - 1:
+            self.current_sentence_index += 1
+            self.play_next_sentence()
+            
+        # Update progress bar
+        if self.temp_files:
+            try:
+                # Calculate total position including all previous chunks
+                current_pos = 0
+                for i in range(self.current_sentence_index):
+                    sound = pygame.mixer.Sound(self.temp_files[i])
+                    current_pos += sound.get_length()
+                
+                # Add current chunk position
+                if current_channel.get_busy():
+                    current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
+                    elapsed = time.time() - self.playback_start_time
+                    current_pos += min(elapsed, current_sound.get_length())
+                
+                # Calculate total duration
+                total_duration = sum(pygame.mixer.Sound(f).get_length() 
+                                   for f in self.temp_files)
+                
+                # Update progress
+                if total_duration > 0:
+                    self.progress_bar.value = (current_pos / total_duration) * 100
+                    self.current_time.text = self.format_time(current_pos)
+                    self.total_time.text = self.format_time(total_duration)
+                    
+            except Exception as e:
+                print(f"Error updating progress: {str(e)}")
+        
+        return True
 
     def show_file_chooser(self, instance):
         self.file_chooser_popup = FileChooserPopup(callback=self.on_file_selected)
@@ -986,7 +940,6 @@ class MeloTTSUI(BoxLayout):
         if pygame.mixer.music.get_busy():
             pygame.mixer.music.stop()
         self.is_playing = False
-        self.play_pause_btn.text = 'Play'
         self.progress_bar.value = 0
         self.current_time.text = '0:00'
         self.total_time.text = '0:00'
@@ -997,54 +950,6 @@ class MeloTTSUI(BoxLayout):
             self.status_label.text = 'Please enter text or select a file'
             return None
         return text
-
-    def play_next_sentence(self):
-        """Play the next sentence in the queue"""
-        if not self.temp_files or self.current_sentence_index >= len(self.temp_files):
-            # Reset playback state when we reach the end
-            self.is_playing = False
-            self.play_pause_btn.text = 'Play'
-            self.current_sentence_index = 0
-            return
-
-        try:
-            # Load and play the next sentence
-            sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
-            channel = pygame.mixer.Channel(self.current_channel)
-            
-            # Set up callback for when this sentence finishes
-            def sentence_finished():
-                if self.current_sentence_index < len(self.temp_files) - 1:
-                    self.current_sentence_index += 1
-                    Clock.schedule_once(lambda dt: self.play_next_sentence(), 0)
-                else:
-                    # Last sentence finished
-                    self.is_playing = False
-                    self.play_pause_btn.text = 'Play'
-                    self.current_sentence_index = 0
-            
-            # Play the sound and set up the callback
-            channel.play(sound)
-            channel.set_endevent(pygame.USEREVENT + self.current_channel)
-            
-            # Switch channels for next sentence (ping-pong between 0 and 1)
-            self.current_channel = 1 - self.current_channel
-            
-            # Schedule checking for sentence completion
-            def check_completion(dt):
-                if not channel.get_busy():
-                    sentence_finished()
-                    return False  # Stop the schedule
-                return True  # Continue checking
-            
-            # Start checking completion with a shorter interval
-            Clock.schedule_interval(check_completion, 0.05)
-            
-        except Exception as e:
-            print(f"Error playing sentence {self.current_sentence_index}: {e}")
-            self.status_label.text = 'Playback error'
-            self.is_playing = False
-            self.play_pause_btn.text = 'Play'
 
     def synthesize_audio(self, instance):
         try:
@@ -1057,10 +962,13 @@ class MeloTTSUI(BoxLayout):
             self.progress_bar.buffer_value = 0
             self.synthesize_btn.disabled = True
             
+            # Reset stop flag
+            self.should_stop = False
+            
             # Stop any currently playing audio
-            pygame.mixer.stop()
+            pygame.mixer.Channel(self.current_channel).stop()
+            pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
             self.is_playing = False
-            self.play_pause_btn.text = 'Play'
             self.current_sentence_index = 0
             
             # Clean up previous temp files
@@ -1070,100 +978,96 @@ class MeloTTSUI(BoxLayout):
                 except:
                     pass
             self.temp_files = []
+            
+            # Create a queue for audio chunks
+            self.audio_queue = queue.Queue()
+            self.total_sentences = len(split_sentences(text, self.language_spinner.text))
+            self.processed_sentences = 0
+
+            def process_sentence(sentence):
+                if self.should_stop:
+                    return
+                    
+                try:
+                    # Generate audio for the sentence
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                    models[self.language_spinner.text].tts_to_file(
+                        sentence,
+                        models[self.language_spinner.text].hps.data.spk2id[self.speaker_spinner.text],
+                        temp_file.name,
+                        speed=self.speed_slider.value
+                    )
+                    
+                    if self.should_stop:
+                        os.unlink(temp_file.name)
+                        return
+                        
+                    # Add to temp files list and queue
+                    self.temp_files.append(temp_file.name)
+                    self.audio_queue.put(temp_file.name)
+                    
+                    # Update progress
+                    self.processed_sentences += 1
+                    progress = (self.processed_sentences / self.total_sentences) * 100
+                    Clock.schedule_once(lambda dt: setattr(self.progress_bar, 'buffer_value', progress))
+                    
+                    # Start playback if this is the first sentence
+                    if len(self.temp_files) == 1 and not self.should_stop:
+                        Clock.schedule_once(lambda dt: self.start_playback())
+                        
+                except Exception as e:
+                    print(f"Error processing sentence: {str(e)}")
 
             def generate_audio():
                 try:
-                    language = self.language_spinner.text
-                    speaker = self.speaker_spinner.text
-                    speed = self.speed_slider.value
-                    
                     # Split text into sentences
-                    sentences = split_sentences(text, language)
-                    if not sentences:
-                        Clock.schedule_once(lambda dt: setattr(self.status_label, 'text', 'No text to process'), 0)
-                        Clock.schedule_once(lambda dt: setattr(self.synthesize_btn, 'disabled', False), 0)
+                    texts = split_sentences(text, self.language_spinner.text)
+                    if not texts:
                         return
+                    
+                    # Process sentences one by one
+                    for sentence in texts:
+                        if self.should_stop:
+                            break
+                        process_sentence(sentence)
                         
-                    self.total_sentences = len(sentences)
-                    processed_sentences = []
+                    if not self.should_stop:
+                        self.status_label.text = 'Ready'
+                    self.synthesize_btn.disabled = False
                     
-                    def process_sentence(index):
-                        if index >= len(sentences):
-                            return
-                            
-                        sentence = sentences[index].strip()
-                        if not sentence:
-                            process_next_sentence(index + 1)
-                            return
-                            
-                        try:
-                            # Create temp file for this sentence
-                            temp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                            self.temp_files.append(temp.name)
-                            
-                            # Generate audio for the sentence
-                            audio = models[language].tts_to_file(
-                                sentence,
-                                models[language].hps.data.spk2id[speaker],
-                                temp.name,
-                                speed=speed
-                            )
-                            
-                            processed_sentences.append(temp.name)
-                            
-                            def update_progress(dt):
-                                progress = ((index + 1) / len(sentences)) * 100
-                                self.progress_bar.buffer_value = progress
-                                
-                                # Start playing if this is the first sentence
-                                if index == 0:
-                                    self.current_sentence_index = 0
-                                    self.is_playing = True
-                                    self.play_pause_btn.text = 'Pause'
-                                    self.status_label.text = 'Playing'
-                                    self.play_next_sentence()
-                                
-                                # Process next sentence
-                                process_next_sentence(index + 1)
-                                
-                            Clock.schedule_once(update_progress)
-                            
-                        except Exception as e:
-                            print(f"Error processing sentence {index}: {e}")
-                            self.status_label.text = f'Error processing sentence {index + 1}'
-                            self.synthesize_btn.disabled = False
-                    
-                    def process_next_sentence(index):
-                        if index < len(sentences):
-                            process_sentence(index)
-                        else:
-                            Clock.schedule_once(lambda dt: setattr(self.synthesize_btn, 'disabled', False), 0)
-                    
-                    # Start with first sentence
-                    process_sentence(0)
-
                 except Exception as e:
-                    def show_error(dt):
-                        self.status_label.text = f'Error: {str(e)}'
-                        self.synthesize_btn.disabled = False
-                        self.is_playing = False
-                    Clock.schedule_once(show_error)
+                    print(f"Error generating audio: {str(e)}")
+                    self.status_label.text = 'Error'
+                    self.synthesize_btn.disabled = False
 
+            # Start audio generation in a separate thread
             threading.Thread(target=generate_audio, daemon=True).start()
-
+            
         except Exception as e:
-            self.status_label.text = f'Error: {str(e)}'
+            print(f"Error in synthesize_audio: {str(e)}")
+            self.status_label.text = 'Error'
             self.synthesize_btn.disabled = False
 
-    def __del__(self):
+    def cleanup(self):
+        """Clean up resources before closing"""
+        self.should_stop = True
+        
+        # Stop playback
+        pygame.mixer.Channel(self.current_channel).stop()
+        pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
+        self.is_playing = False
+        
+        # Cancel any scheduled events
+        if self._update_event:
+            self._update_event.cancel()
+            
         # Clean up temp files
         for temp_file in self.temp_files:
             try:
                 os.unlink(temp_file)
             except:
                 pass
-        if self._update_event:
-            self._update_event.cancel()
+        self.temp_files = []
 
     def on_model_change(self, spinner, text):
         if text == 'Verbadik (Pro Version)':
@@ -1193,9 +1097,13 @@ class MeloTTSUI(BoxLayout):
 
 class MeloTTSApp(App):
     def build(self):
-        return MeloTTSUI()
+        self.ui = MeloTTSUI()
+        return self.ui
 
     def on_stop(self):
+        """Called when the application is about to close"""
+        if hasattr(self, 'ui'):
+            self.ui.cleanup()
         pygame.mixer.quit()
 
 if __name__ == '__main__':
