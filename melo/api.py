@@ -9,6 +9,7 @@ import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 import torch
+import logging
 
 from . import utils
 from . import commons
@@ -73,12 +74,30 @@ class TTS(nn.Module):
 
     @staticmethod
     def split_sentences_into_pieces(text, language, quiet=False):
-        texts = split_sentence(text, language_str=language)
-        if not quiet:
-            print(" > Text split to sentences.")
-            print('\n'.join(texts))
-            print(" > ===========================")
-        return texts
+        if language in ['ZH', 'JP', 'KR']:
+            # For Asian languages, split on punctuation and preserve it
+            pattern = r'([。！？；])'
+            sentences = re.split(pattern, text)
+            # Combine punctuation with previous sentence
+            result = []
+            for i in range(0, len(sentences)-1, 2):
+                if i+1 < len(sentences):
+                    result.append(sentences[i] + sentences[i+1])
+                else:
+                    result.append(sentences[i])
+            return result
+        else:
+            # For other languages, split on standard sentence endings
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            # Further split long sentences at commas or natural pauses
+            result = []
+            for sentence in sentences:
+                if len(sentence.split()) > 15:  # If sentence is long
+                    parts = re.split(r'(?<=[,;])\s+', sentence)
+                    result.extend(parts)
+                else:
+                    result.append(sentence)
+            return result
 
     def tts_to_file(self, text, speaker_id, output_path=None, sdp_ratio=0.2, noise_scale=0.6, noise_scale_w=0.8, speed=1.0, pbar=None, format=None, position=None, quiet=False,):
         language = self.language
@@ -133,3 +152,43 @@ class TTS(nn.Module):
                 soundfile.write(output_path, audio, self.hps.data.sampling_rate, format=format)
             else:
                 soundfile.write(output_path, audio, self.hps.data.sampling_rate)
+
+    def tts_streaming(self, text, speaker_id, callback):
+        """Stream TTS output sentence by sentence"""
+        texts = self.split_sentences_into_pieces(text, self.language)
+        sr = self.hps.data.sampling_rate
+        
+        for i, sentence in enumerate(texts):
+            if not sentence.strip():
+                continue
+                
+            # Preprocess input
+            bert, ja_bert, phones, tones, lang_ids = utils.get_text_for_tts_infer(
+                sentence, self.language, self.hps, self.device, self.symbol_to_id
+            )
+            
+            with torch.no_grad():
+                x_tst = phones.unsqueeze(0).to(self.device)
+                tones = tones.unsqueeze(0).to(self.device)
+                lang_ids = lang_ids.unsqueeze(0).to(self.device)
+                bert = bert.unsqueeze(0).to(self.device)
+                ja_bert = ja_bert.unsqueeze(0).to(self.device)
+                x_tst_lengths = torch.LongTensor([phones.size(0)]).to(self.device)
+                speakers = torch.LongTensor([speaker_id]).to(self.device)
+                
+                # Generate audio
+                audio = self.model.infer(
+                    x_tst, x_tst_lengths, speakers, tones, lang_ids, bert, ja_bert,
+                    sdp_ratio=0.2, noise_scale=0.6, noise_scale_w=0.8
+                )[0][0, 0].data.cpu().float().numpy()
+                
+                # Add small silence between sentences
+                silence = np.zeros(int(sr * 0.1))
+                audio_chunk = np.concatenate([audio, silence])
+
+                # Stream out the audio chunk with progress info
+                is_last = i == len(texts) - 1
+                callback(audio_chunk, sr, is_last)
+
+            # Clear GPU memory
+            torch.cuda.empty_cache()
