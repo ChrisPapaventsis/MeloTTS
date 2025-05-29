@@ -40,12 +40,201 @@ os.environ['NUMBA_DISABLE_JIT'] = '0'
 
 # Audio stream configuration
 CHUNK_SIZE = 4096
-AUDIO_QUEUE = queue.Queue()
-STREAM = None
-TOTAL_CHUNKS = 0
-BUFFERED_CHUNKS = 0
-PROGRESS_CALLBACK = None
-STREAM_ERROR = None
+SAMPLE_RATE = 44100
+CHANNELS = 1
+DTYPE = np.float32
+
+class AudioPlayer:
+    def __init__(self):
+        self.stream = None
+        self.audio_data = None
+        self.sample_rate = SAMPLE_RATE
+        self.current_frame = 0
+        self.is_playing = False
+        self.audio_queue = queue.Queue()
+        self.current_file_index = 0
+        self.files = []
+        self.paused_position = 0
+        self.processed_duration = 0
+        self.estimated_total_duration = 0
+        self.remaining_words = 0
+        
+    def load_file(self, filename):
+        """Load an audio file"""
+        try:
+            audio_data, sample_rate = sf.read(filename, dtype=DTYPE)
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data[:, 0]  # Convert to mono if stereo
+            return audio_data, sample_rate
+        except Exception as e:
+            print(f"Error loading audio file: {e}")
+            return None, None
+            
+    def audio_callback(self, outdata, frames, time, status):
+        """Callback for the sounddevice stream"""
+        if status:
+            print(status)
+        
+        if self.audio_data is None or not self.is_playing:
+            outdata.fill(0)
+            return
+            
+        if self.current_frame + frames > len(self.audio_data):
+            # End of current chunk
+            remaining = len(self.audio_data) - self.current_frame
+            outdata[:remaining, 0] = self.audio_data[self.current_frame:self.current_frame + remaining]
+            outdata[remaining:, 0] = 0
+            
+            # Move to next file
+            self.current_file_index += 1
+            if self.current_file_index < len(self.files):
+                next_data, next_sr = self.load_file(self.files[self.current_file_index])
+                if next_data is not None:
+                    self.audio_data = next_data
+                    self.current_frame = 0
+                    # Fill remaining buffer with start of next chunk
+                    remaining_frames = frames - remaining
+                    if remaining_frames > 0:
+                        outdata[remaining:, 0] = next_data[:remaining_frames]
+                        self.current_frame = remaining_frames
+            else:
+                self.is_playing = False
+                self.stream.stop()
+        else:
+            outdata[:, 0] = self.audio_data[self.current_frame:self.current_frame + frames]
+            self.current_frame += frames
+            
+    def play(self, files, start_from_beginning=True):
+        """Start playing a list of audio files"""
+        if not files:
+            return False
+            
+        if start_from_beginning:
+            self.files = files
+            self.current_file_index = 0
+            self.current_frame = 0
+            self.paused_position = 0
+            
+            # Load first file
+            audio_data, sample_rate = self.load_file(files[0])
+            if audio_data is None:
+                return False
+                
+            self.audio_data = audio_data
+            self.sample_rate = sample_rate
+        else:
+            # Resume from paused position
+            self.seek(self.paused_position)
+            
+        if self.stream is None or not self.stream.active:
+            self.stream = sd.OutputStream(
+                channels=CHANNELS,
+                samplerate=self.sample_rate,
+                callback=self.audio_callback,
+                dtype=DTYPE
+            )
+            
+        self.stream.start()
+        self.is_playing = True
+        return True
+        
+    def pause(self):
+        """Pause playback"""
+        if self.is_playing:
+            self.paused_position = self.get_position()
+            self.is_playing = False
+            if self.stream:
+                self.stream.stop()
+            
+    def resume(self):
+        """Resume playback from paused position"""
+        if not self.is_playing and self.files:
+            return self.play(self.files, start_from_beginning=False)
+        return False
+        
+    def seek(self, position):
+        """Seek to a specific position in seconds"""
+        if not self.files:
+            return
+            
+        # Calculate total duration up to target position
+        current_pos = 0
+        for i, file in enumerate(self.files):
+            audio_data, sr = sf.read(file)
+            duration = len(audio_data) / sr
+            
+            if current_pos + duration > position:
+                # Found the target file
+                self.current_file_index = i
+                self.audio_data = audio_data
+                self.current_frame = int((position - current_pos) * sr)
+                self.current_frame = min(self.current_frame, len(self.audio_data))
+                self.paused_position = position  # Update paused position
+                break
+            current_pos += duration
+            
+    def get_position(self):
+        """Get current position in seconds"""
+        if not self.files:
+            return 0
+            
+        # Add up durations of completed files
+        position = 0
+        for i in range(self.current_file_index):
+            audio_data, sr = sf.read(self.files[i])
+            position += len(audio_data) / sr
+            
+        # Add current file position
+        if self.audio_data is not None and self.sample_rate > 0:
+            position += self.current_frame / self.sample_rate
+            
+        return position
+        
+    def get_duration(self):
+        """Get the total duration (either actual if fully processed, or estimated)"""
+        if not self.files:
+            return 0
+        if self.remaining_words == 0:  # All processed
+            return self.get_processed_duration()
+        return self.estimated_total_duration
+
+    def stop(self):
+        """Stop playback and clean up"""
+        self.is_playing = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        self.audio_data = None
+        self.current_frame = 0
+        self.current_file_index = 0
+        self.files = []
+
+    def get_processed_duration(self):
+        """Get total duration of processed chunks"""
+        if not self.files:
+            return 0
+            
+        total_duration = 0
+        for file in self.files:
+            try:
+                audio_data, sr = sf.read(file)
+                total_duration += len(audio_data) / sr
+            except Exception:
+                break  # Stop if we hit an unprocessed or invalid chunk
+        return total_duration
+
+    def estimate_duration_from_words(self, word_count):
+        """Estimate duration in seconds based on word count"""
+        return (word_count / 165.0) * 60  # Convert to seconds (165 words per minute)
+
+    def update_duration_estimate(self, remaining_words):
+        """Update duration estimate based on processed chunks and remaining words"""
+        self.remaining_words = remaining_words
+        processed_duration = self.get_processed_duration()
+        remaining_duration = self.estimate_duration_from_words(remaining_words)
+        self.estimated_total_duration = processed_duration + remaining_duration
+        return self.estimated_total_duration
 
 # Redirect stdout to devnull for TTS model output
 class DummyFile:
@@ -64,11 +253,6 @@ sys.stdout = DummyFile()
 device = 'cpu'
 models = {
     'EN': TTS(language='EN', device=device),
-    'ES': TTS(language='ES', device=device),
-    'FR': TTS(language='FR', device=device),
-    'ZH': TTS(language='ZH', device=device),
-    'JP': TTS(language='JP', device=device),
-    'KR': TTS(language='KR', device=device),
 }
 sys.stdout = original_stdout
 
@@ -201,15 +385,6 @@ for model in models.values():
         text, speaker_id, stream_audio_callback
     )
 
-default_text_dict = {
-    'EN': 'The field of text-to-speech has seen rapid development recently.',
-    'ES': 'El campo de la conversión de texto a voz ha experimentado un rápido desarrollo recientemente.',
-    'FR': 'Le domaine de la synthèse vocale a connu un développement rapide récemment',
-    'ZH': 'text-to-speech 领域近年来发展迅速',
-    'JP': 'テキスト読み上げの分野は最近急速な発展を遂げています',
-    'KR': '최근 텍스트 음성 변환 분야가 급속도로 발전하고 있습니다.',
-}
-
 class RoundedSpinner(Spinner):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -264,14 +439,37 @@ class RoundedSlider(Slider):
         self.padding = dp(20)
 
 class CustomProgressBar(ProgressBar):
-    value = NumericProperty(0)
-    buffer_value = NumericProperty(0)
+    value = NumericProperty(0)  # Current playback position
+    buffer_value = NumericProperty(0)  # Processed/buffered progress
+    estimated_value = NumericProperty(0)  # Total estimated duration progress
+    total_duration = NumericProperty(0)
+    on_seek = ObjectProperty(None)  # Callback for seek events
 
     def set_value(self, value):
         Animation(value=value, duration=0.3).start(self)
 
     def set_buffer_value(self, value):
         Animation(buffer_value=value, duration=0.3).start(self)
+
+    def set_estimated_value(self, value):
+        Animation(estimated_value=value, duration=0.3).start(self)
+
+    def set_total_duration(self, duration):
+        self.total_duration = duration
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.on_seek:
+            # Calculate the position as a percentage
+            seek_pos = (touch.x - self.x) / self.width
+            seek_pos = max(0, min(1, seek_pos))  # Clamp between 0 and 1
+            
+            # Convert to time position
+            time_pos = seek_pos * self.total_duration
+            
+            # Call the seek callback
+            self.on_seek(time_pos)
+            return True
+        return super().on_touch_down(touch)
 
 class AudioProgressBar(CustomProgressBar):
     sound = ObjectProperty(None)
@@ -404,6 +602,34 @@ class FileChooserPopup(Popup):
             self.dismiss()  # Dismiss the popup first
             Clock.schedule_once(lambda dt: self.callback(selected_file), 0)  # Call callback in next frame
 
+class PlayPauseButton(RoundedButton):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.size_hint = (None, None)
+        self.width = dp(70)
+        self.height = dp(70)
+        self.text = 'Play'
+        self.font_size = '16sp'
+        self.background_color = (0.2, 0.6, 1, 1)
+
+class ControlButton(RoundedButton):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.size_hint = (None, None)
+        self.width = dp(60)
+        self.height = dp(60)
+        self.font_size = '20sp'
+        self.background_color = (0.2, 0.6, 1, 1)
+
+class CloseButton(RoundedButton):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.text = 'Close'
+        self.size_hint = (None, None)
+        self.width = dp(100)
+        self.height = dp(50)
+        self.background_color = (0.8, 0.2, 0.2, 1)  # Red color for close button
+
 Builder.load_string('''
 <RoundedSpinner>:
     canvas.before:
@@ -467,7 +693,13 @@ Builder.load_string('''
             size: self.width, self.height
             radius: [self.height/2]
         Color:
-            rgba: 0.6, 0.6, 0.6, 1  # Buffer color (gray)
+            rgba: 0.85, 0.85, 0.85, 1  # Total estimated duration color (lightest gray)
+        RoundedRectangle:
+            pos: self.x, self.y
+            size: self.width * (self.estimated_value / 100.0), self.height
+            radius: [self.height/2]
+        Color:
+            rgba: 0.7, 0.7, 0.7, 1  # Buffered progress color (darker gray)
         RoundedRectangle:
             pos: self.x, self.y
             size: self.width * (self.buffer_value / 100.0), self.height
@@ -479,6 +711,45 @@ Builder.load_string('''
             size: self.width * (self.value / 100.0), self.height
             radius: [self.height/2]
 ''')
+
+def count_words(text):
+    """
+    Count words in text more accurately:
+    - Handles multiple spaces/newlines
+    - Handles punctuation
+    - Handles special characters
+    - Counts hyphenated words as one word
+    """
+    # Remove extra whitespace and normalize
+    text = ' '.join(text.split())
+    
+    # Count words, handling special cases
+    words = text.split()
+    word_count = 0
+    
+    for word in words:
+        # Remove punctuation from word edges
+        word = word.strip('.,!?()[]{}:;"\'/\\')
+        
+        # Skip if empty after cleaning
+        if not word:
+            continue
+            
+        # Count numbers as words
+        if word.replace('.', '').replace(',', '').isdigit():
+            word_count += 1
+            continue
+            
+        # Count hyphenated words as one word
+        if '-' in word:
+            word_count += 1
+            continue
+            
+        # Count regular words
+        if any(c.isalpha() for c in word):
+            word_count += 1
+            
+    return word_count
 
 class MeloTTSUI(BoxLayout):
     current_sound = ObjectProperty(None, allownone=True)
@@ -493,16 +764,21 @@ class MeloTTSUI(BoxLayout):
     current_sentence_index = NumericProperty(0)
     total_sentences = NumericProperty(0)
     current_channel = 0
-    should_stop = False  # Flag to signal threads to stop
+    should_stop = False
+    playback_position = 0  # Total elapsed time in seconds
+    last_update_time = 0   # Last time we updated position
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.should_stop = False
+        self.audio_player = AudioPlayer()
+        self.default_speaker = 'EN-BR'  # Set British English as default
+        self.default_speed = 1.0  # Set default speed
         
         # Set minimum window size and default size
-        Window.minimum_width = dp(400)
-        Window.minimum_height = dp(800)
-        Window.size = (dp(500), dp(900))
+        Window.minimum_width = dp(200)
+        Window.minimum_height = dp(300)
+        Window.size = (dp(200), dp(300))
         
         # Initialize update event
         self._update_event = None
@@ -527,84 +803,6 @@ class MeloTTSUI(BoxLayout):
         
         # Bind the layout height to its minimum height for proper scrolling
         main_layout.bind(minimum_height=main_layout.setter('height'))
-
-        # Title and Model Selection
-        header_box = BoxLayout(
-            orientation='horizontal',
-            size_hint_y=None,
-            height=dp(70),
-            spacing=dp(15),
-            padding=[dp(20), 0]
-        )
-
-        # Model Selection
-        self.model_spinner = RoundedSpinner(
-            text='MeloTTS',
-            values=('MeloTTS', 'Verbadik (Pro Version)'),
-            size_hint=(None, None),
-            width=dp(250),
-            height=dp(60)
-        )
-        self.model_spinner.bind(text=self.on_model_change)
-
-        header_box.add_widget(Widget())
-        header_box.add_widget(self.model_spinner)
-        header_box.add_widget(Widget())
-
-        main_layout.add_widget(header_box)
-
-        # Language selection
-        self.language_spinner = RoundedSpinner(
-            text='EN',
-            values=('EN', 'ES', 'FR', 'ZH', 'JP', 'KR'),
-            size_hint_y=None,
-            height=dp(60)
-        )
-        self.language_spinner.bind(text=self.on_language_change)
-        main_layout.add_widget(self.language_spinner)
-
-        # Speaker selection
-        self.speaker_spinner = RoundedSpinner(
-            text='EN-US',
-            values=list(models['EN'].hps.data.spk2id.keys()),
-            size_hint_y=None,
-            height=dp(60)
-        )
-        main_layout.add_widget(self.speaker_spinner)
-
-        # Speed slider and layout
-        speed_layout = BoxLayout(
-            orientation='horizontal',
-            size_hint_y=None,
-            height=dp(60)
-        )
-        
-        speed_label = Label(
-            text='Speed:',
-            size_hint_x=0.3,
-            font_size=sp(18)
-        )
-        
-        self.speed_slider = RoundedSlider(
-            min=0.3,
-            max=3.0,
-            value=1.0,
-            step=0.1,
-            cursor_size=(dp(30), dp(30))
-        )
-        self.speed_slider.bind(value=self.on_speed_change)
-        
-        self.speed_value_label = Label(
-            text='1.0',
-            size_hint_x=0.2,
-            font_size=sp(18)
-        )
-        
-        speed_layout.add_widget(speed_label)
-        speed_layout.add_widget(self.speed_slider)
-        speed_layout.add_widget(self.speed_value_label)
-        
-        main_layout.add_widget(speed_layout)
 
         # File selection
         file_box = BoxLayout(
@@ -646,26 +844,6 @@ class MeloTTSUI(BoxLayout):
         file_box.add_widget(buttons_box)
         main_layout.add_widget(file_box)
 
-        # Text input
-        text_label = Label(
-            text='Or enter text directly:',
-            size_hint_y=None,
-            height=dp(40),
-            color=(1, 1, 1, 1),
-            font_size=sp(18),
-            halign='left'
-        )
-        text_label.bind(size=text_label.setter('text_size'))
-        main_layout.add_widget(text_label)
-
-        self.text_input = RoundedTextInput(
-            text=default_text_dict['EN'],
-            multiline=True,
-            size_hint_y=None,
-            height=dp(150)
-        )
-        main_layout.add_widget(self.text_input)
-
         # Synthesize button
         self.synthesize_btn = RoundedButton(
             text='Generate',
@@ -675,6 +853,31 @@ class MeloTTSUI(BoxLayout):
         self.synthesize_btn.bind(on_press=self.synthesize_audio)
         main_layout.add_widget(self.synthesize_btn)
 
+        # Controls box with forward/backward buttons
+        controls_box = BoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(80),
+            spacing=dp(15)
+        )
+        
+        self.backward_btn = ControlButton(text='<--15s')
+        self.backward_btn.bind(on_press=self.seek_backward)
+        
+        self.play_pause_btn = PlayPauseButton()
+        self.play_pause_btn.bind(on_press=self.toggle_play_pause)
+        
+        self.forward_btn = ControlButton(text='15s-->')
+        self.forward_btn.bind(on_press=self.seek_forward)
+        
+        controls_box.add_widget(Widget())  # Spacer
+        controls_box.add_widget(self.backward_btn)
+        controls_box.add_widget(self.play_pause_btn)
+        controls_box.add_widget(self.forward_btn)
+        controls_box.add_widget(Widget())  # Spacer
+        
+        main_layout.add_widget(controls_box)
+
         # Progress bar and time labels
         progress_box = BoxLayout(
             orientation='vertical',
@@ -683,12 +886,14 @@ class MeloTTSUI(BoxLayout):
             spacing=dp(5)
         )
 
-        self.progress_bar = AudioProgressBar(
+        self.progress_bar = CustomProgressBar(
             max=100,
             value=0,
             size_hint_y=None,
             height=dp(30)
         )
+        # Bind the seek callback
+        self.progress_bar.on_seek = self.on_progress_seek
 
         time_box = BoxLayout(
             orientation='horizontal',
@@ -728,6 +933,23 @@ class MeloTTSUI(BoxLayout):
             font_size=sp(18)
         )
         main_layout.add_widget(self.status_label)
+
+        # Add close button at the bottom
+        close_box = BoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=dp(60),
+            spacing=dp(15)
+        )
+        
+        self.close_btn = CloseButton()
+        self.close_btn.bind(on_press=self.close_application)
+        
+        close_box.add_widget(Widget())  # Spacer
+        close_box.add_widget(self.close_btn)
+        close_box.add_widget(Widget())  # Spacer
+        
+        main_layout.add_widget(close_box)
 
         # Add padding at the bottom
         main_layout.add_widget(Widget(size_hint_y=None, height=dp(20)))
@@ -804,24 +1026,22 @@ class MeloTTSUI(BoxLayout):
                 self.total_time.text = self.format_time(total_duration)
 
     def start_playback(self):
-        """Start playing the first available sentence"""
+        """Start playing from the beginning"""
         if not self.temp_files:
             return
             
-        # Stop any currently playing audio on both channels
-        pygame.mixer.Channel(self.current_channel).stop()
-        pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
-            
+        # Reset playback state
+        self.playback_position = 0
+        self.last_update_time = time.time()
+        self.current_sentence_index = 0
+        
+        # Start playback
         self.is_playing = True
+        self.play_pause_btn.text = 'Pause'
         self.status_label.text = 'Playing'
-        
-        # Reset playback start time
-        self.playback_start_time = time.time()
-        
-        # Start playing from the current sentence
         self.play_next_sentence()
         
-        # Start the background playback checker
+        # Start progress updates
         Clock.schedule_interval(self.check_playback, 0.1)
 
     def play_next_sentence(self):
@@ -829,7 +1049,10 @@ class MeloTTSUI(BoxLayout):
         if not self.temp_files or self.current_sentence_index >= len(self.temp_files):
             # Reset playback state when we reach the end
             self.is_playing = False
+            self.play_pause_btn.text = 'Play'
             self.current_sentence_index = 0
+            self.playback_position = 0
+            self.last_update_time = 0
             return
 
         try:
@@ -840,60 +1063,46 @@ class MeloTTSUI(BoxLayout):
             # Load and play the current sentence
             current_channel = pygame.mixer.Channel(self.current_channel)
             current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
+            
+            # Set up callback for when sound finishes
+            def sound_finished():
+                if self.is_playing and self.current_sentence_index < len(self.temp_files) - 1:
+                    self.current_sentence_index += 1
+                    Clock.schedule_once(lambda dt: self.play_next_sentence(), 0)
+            
+            current_channel.set_endevent(pygame.USEREVENT)
             current_channel.play(current_sound)
             
-            # Reset playback start time
-            self.playback_start_time = time.time()
+            # Update timing
+            self.last_update_time = time.time()
             
-            # Pre-load next sentence but don't queue it
+            # Pre-load next sentence
             next_index = self.current_sentence_index + 1
             if next_index < len(self.temp_files):
-                # Just load the next sound into memory
                 pygame.mixer.Sound(self.temp_files[next_index])
                 
         except Exception as e:
             print(f"Error playing sentence: {str(e)}")
 
     def check_playback(self, dt):
-        """Check playback status and queue next sentence if needed"""
-        if not self.is_playing:
-            return False
+        """Update playback progress"""
+        if not self.temp_files:
+            return True
             
-        current_channel = pygame.mixer.Channel(self.current_channel)
+        # Get current position and total duration
+        position = self.audio_player.get_position()
+        total_duration = self.audio_player.get_duration()  # Use estimated total duration
         
-        # If current sentence is done and we have more in queue
-        if not current_channel.get_busy() and self.current_sentence_index < len(self.temp_files) - 1:
-            self.current_sentence_index += 1
-            self.play_next_sentence()
+        # Update progress even when paused
+        if total_duration > 0:
+            # Scale progress against total estimated duration
+            progress = (position / total_duration) * 100
+            self.progress_bar.value = min(progress, 100)
             
-        # Update progress bar
-        if self.temp_files:
-            try:
-                # Calculate total position including all previous chunks
-                current_pos = 0
-                for i in range(self.current_sentence_index):
-                    sound = pygame.mixer.Sound(self.temp_files[i])
-                    current_pos += sound.get_length()
+            # Update time labels
+            self.current_time.text = self.format_time(position)
+            self.total_time.text = self.format_time(total_duration)
                 
-                # Add current chunk position
-                if current_channel.get_busy():
-                    current_sound = pygame.mixer.Sound(self.temp_files[self.current_sentence_index])
-                    elapsed = time.time() - self.playback_start_time
-                    current_pos += min(elapsed, current_sound.get_length())
-                
-                # Calculate total duration
-                total_duration = sum(pygame.mixer.Sound(f).get_length() 
-                                   for f in self.temp_files)
-                
-                # Update progress
-                if total_duration > 0:
-                    self.progress_bar.value = (current_pos / total_duration) * 100
-                    self.current_time.text = self.format_time(current_pos)
-                    self.total_time.text = self.format_time(total_duration)
-                    
-            except Exception as e:
-                print(f"Error updating progress: {str(e)}")
-        
         return True
 
     def show_file_chooser(self, instance):
@@ -916,10 +1125,6 @@ class MeloTTSUI(BoxLayout):
                 filename = filename[:27] + "..."
             self.file_label.text = filename
             
-            self.text_input.text = file_content
-            self.remove_btn.disabled = False
-            self.remove_btn.opacity = 1
-            
             # Trigger synthesis automatically
             self.synthesize_audio(None)
             
@@ -931,8 +1136,6 @@ class MeloTTSUI(BoxLayout):
     def remove_file(self, instance):
         self.selected_file = ''
         self.file_label.text = 'No file selected'
-        # Restore default text
-        self.text_input.text = default_text_dict[self.language_spinner.text]
         # Disable and hide remove button
         self.remove_btn.disabled = True
         self.remove_btn.opacity = 0.5
@@ -945,11 +1148,21 @@ class MeloTTSUI(BoxLayout):
         self.total_time.text = '0:00'
 
     def get_text_to_synthesize(self):
-        text = self.text_input.text.strip()
-        if not text:
-            self.status_label.text = 'Please enter text or select a file'
+        """Get text from selected file"""
+        if not self.selected_file:
+            self.status_label.text = 'Please select a file'
             return None
-        return text
+            
+        try:
+            with open(self.selected_file, 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+            if not text:
+                self.status_label.text = 'Selected file is empty'
+                return None
+            return text
+        except Exception as e:
+            self.status_label.text = f'Error reading file: {str(e)}'
+            return None
 
     def synthesize_audio(self, instance):
         try:
@@ -957,17 +1170,33 @@ class MeloTTSUI(BoxLayout):
             if not text:
                 return
 
+            # Calculate initial word count using the robust counter
+            total_words = count_words(text)
+            print(f"Total words in text: {total_words}")  # Debug output
+            
+            # Calculate initial duration estimate (in seconds)
+            initial_estimate = (total_words / 165.0) * 60  # 165 words per minute
+            print(f"Initial duration estimate: {initial_estimate:.2f} seconds ({initial_estimate/60:.2f} minutes)")
+            
+            # Set initial values in audio player
+            self.audio_player.remaining_words = total_words
+            self.audio_player.estimated_total_duration = initial_estimate
+            
+            # Set initial total duration and show full estimated length
+            self.progress_bar.set_total_duration(initial_estimate)
+            self.progress_bar.set_estimated_value(100)  # Show full estimated length
+            self.progress_bar.set_buffer_value(0)  # Reset buffer progress
+            self.progress_bar.set_value(0)  # Reset playback progress
+            self.total_time.text = self.format_time(initial_estimate)
+
             self.status_label.text = 'Initializing...'
-            self.progress_bar.value = 0
-            self.progress_bar.buffer_value = 0
             self.synthesize_btn.disabled = True
             
             # Reset stop flag
             self.should_stop = False
             
-            # Stop any currently playing audio
-            pygame.mixer.Channel(self.current_channel).stop()
-            pygame.mixer.Channel((self.current_channel + 1) % 2).stop()
+            # Stop any current playback
+            self.audio_player.stop()
             self.is_playing = False
             self.current_sentence_index = 0
             
@@ -979,9 +1208,9 @@ class MeloTTSUI(BoxLayout):
                     pass
             self.temp_files = []
             
-            # Create a queue for audio chunks
-            self.audio_queue = queue.Queue()
-            self.total_sentences = len(split_sentences(text, self.language_spinner.text))
+            # Split text into sentences
+            sentences = split_sentences(text, 'EN')
+            self.total_sentences = len(sentences)
             self.processed_sentences = 0
 
             def process_sentence(sentence):
@@ -991,25 +1220,56 @@ class MeloTTSUI(BoxLayout):
                 try:
                     # Generate audio for the sentence
                     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                    models[self.language_spinner.text].tts_to_file(
+                    models['EN'].tts_to_file(
                         sentence,
-                        models[self.language_spinner.text].hps.data.spk2id[self.speaker_spinner.text],
+                        models['EN'].hps.data.spk2id[self.default_speaker],
                         temp_file.name,
-                        speed=self.speed_slider.value
+                        speed=self.default_speed  # Use default speed
                     )
                     
                     if self.should_stop:
                         os.unlink(temp_file.name)
                         return
                         
-                    # Add to temp files list and queue
+                    # Add to temp files list
                     self.temp_files.append(temp_file.name)
-                    self.audio_queue.put(temp_file.name)
                     
-                    # Update progress
+                    # Update progress and processed duration
                     self.processed_sentences += 1
-                    progress = (self.processed_sentences / self.total_sentences) * 100
-                    Clock.schedule_once(lambda dt: setattr(self.progress_bar, 'buffer_value', progress))
+                    
+                    # Calculate remaining words from unprocessed sentences using robust counter
+                    remaining_words = sum(count_words(s) for s in sentences[self.processed_sentences:])
+                    
+                    # Update duration estimates
+                    total_duration = self.audio_player.update_duration_estimate(remaining_words)
+                    processed_duration = self.audio_player.get_processed_duration()
+                    
+                    # Debug output
+                    print(f"Processed duration: {processed_duration:.2f}s, Remaining words: {remaining_words}")
+                    print(f"Total estimate: {total_duration:.2f}s ({total_duration/60:.2f} minutes)")
+                    
+                    # Update progress bar components
+                    if total_duration > 0:
+                        # Keep the total duration at the initial estimate
+                        total_duration = max(total_duration, self.audio_player.estimated_total_duration)
+                        
+                        # Update total duration
+                        Clock.schedule_once(lambda dt: self.progress_bar.set_total_duration(total_duration))
+                        
+                        # Show full estimated length
+                        Clock.schedule_once(lambda dt: self.progress_bar.set_estimated_value(100))
+                        
+                        # Update buffer progress (processed chunks)
+                        buffer_progress = (processed_duration / total_duration) * 100
+                        Clock.schedule_once(lambda dt: self.progress_bar.set_buffer_value(buffer_progress))
+                        
+                        # Update playback progress
+                        if self.is_playing:
+                            playback_progress = (self.audio_player.get_position() / total_duration) * 100
+                            Clock.schedule_once(lambda dt: self.progress_bar.set_value(playback_progress))
+                        
+                        # Update time labels
+                        Clock.schedule_once(lambda dt: setattr(self.total_time, 'text', self.format_time(total_duration)))
                     
                     # Start playback if this is the first sentence
                     if len(self.temp_files) == 1 and not self.should_stop:
@@ -1021,7 +1281,7 @@ class MeloTTSUI(BoxLayout):
             def generate_audio():
                 try:
                     # Split text into sentences
-                    texts = split_sentences(text, self.language_spinner.text)
+                    texts = split_sentences(text, 'EN')
                     if not texts:
                         return
                     
@@ -1048,6 +1308,41 @@ class MeloTTSUI(BoxLayout):
             self.status_label.text = 'Error'
             self.synthesize_btn.disabled = False
 
+    def toggle_play_pause(self, instance):
+        """Toggle between play and pause states"""
+        if not self.temp_files:
+            return
+            
+        if self.audio_player.is_playing:
+            self.audio_player.pause()
+            self.play_pause_btn.text = 'Play'
+            self.status_label.text = 'Paused'
+        else:
+            # If we have a paused position, resume from there
+            if hasattr(self.audio_player, 'paused_position') and self.audio_player.paused_position > 0:
+                if self.audio_player.resume():
+                    self.play_pause_btn.text = 'Pause'
+                    self.status_label.text = 'Playing'
+            else:
+                # Start from beginning
+                if self.audio_player.play(self.temp_files):
+                    self.play_pause_btn.text = 'Pause'
+                    self.status_label.text = 'Playing'
+
+    def start_playback(self):
+        """Start playing from the beginning"""
+        if not self.temp_files:
+            return
+            
+        # Start playback with all files
+        if self.audio_player.play(self.temp_files):
+            self.is_playing = True
+            self.play_pause_btn.text = 'Pause'
+            self.status_label.text = 'Playing'
+            
+            # Start progress updates
+            Clock.schedule_interval(self.check_playback, 0.1)
+
     def cleanup(self):
         """Clean up resources before closing"""
         self.should_stop = True
@@ -1069,25 +1364,6 @@ class MeloTTSUI(BoxLayout):
                 pass
         self.temp_files = []
 
-    def on_model_change(self, spinner, text):
-        if text == 'Verbadik (Pro Version)':
-            self.status_label.text = 'Upgrade to Unlock Verbadik'
-            Clock.schedule_once(lambda dt: setattr(self.model_spinner, 'text', 'MeloTTS'), 1.5)
-            return
-
-        self.status_label.text = 'Ready'
-
-    def on_language_change(self, spinner, text):
-        self.speaker_spinner.values = list(models[text].hps.data.spk2id.keys())
-        self.speaker_spinner.text = self.speaker_spinner.values[0]
-
-        current_text = self.text_input.text
-        if current_text in default_text_dict.values():
-            self.text_input.text = default_text_dict[text]
-
-    def on_speed_change(self, instance, value):
-        self.speed_value_label.text = f'{value:.1f}'
-
     def format_time(self, seconds):
         if not seconds or seconds < 0:
             return '0:00'
@@ -1095,10 +1371,139 @@ class MeloTTSUI(BoxLayout):
         seconds = int(seconds % 60)
         return f'{minutes}:{seconds:02d}'
 
+    def seek_forward(self, instance):
+        """Seek forward by 15 seconds"""
+        if not self.temp_files or not self.audio_player.files:
+            return
+            
+        current_pos = self.audio_player.get_position()
+        processed_duration = self.audio_player.get_processed_duration()
+        
+        # Calculate maximum safe seek position (15 seconds before processed duration)
+        max_safe_seek = max(0, processed_duration - 15.0)
+        
+        # Calculate target position and clamp it
+        target_pos = min(current_pos + 15.0, max_safe_seek)
+        
+        # Store playing state
+        was_playing = self.audio_player.is_playing
+        
+        # Seek to new position
+        self.audio_player.seek(target_pos)
+        
+        # Update progress bar and time labels immediately
+        total_duration = self.audio_player.get_duration()
+        if total_duration > 0:
+            self.progress_bar.value = (target_pos / total_duration) * 100
+            self.current_time.text = self.format_time(target_pos)
+            self.total_time.text = self.format_time(total_duration)
+        
+        # Resume if was playing
+        if was_playing:
+            self.audio_player.resume()
+            
+        # Show feedback if we hit the safe seek limit
+        if target_pos == max_safe_seek:
+            self.status_label.text = 'Processing more audio...'
+            Clock.schedule_once(lambda dt: setattr(self.status_label, 'text', 'Playing' if self.is_playing else 'Paused'), 1.5)
+
+    def seek_backward(self, instance):
+        """Seek backward by 15 seconds"""
+        if not self.temp_files or not self.audio_player.files:
+            return
+            
+        current_pos = self.audio_player.get_position()
+        target_pos = max(0, current_pos - 15.0)
+        
+        # Store playing state
+        was_playing = self.audio_player.is_playing
+        
+        # Seek to new position
+        self.audio_player.seek(target_pos)
+        
+        # Update progress bar and time labels immediately
+        total_duration = self.audio_player.get_duration()
+        if total_duration > 0:
+            self.progress_bar.value = (target_pos / total_duration) * 100
+            self.current_time.text = self.format_time(target_pos)
+            self.total_time.text = self.format_time(total_duration)
+        
+        # Resume if was playing
+        if was_playing:
+            self.audio_player.resume()
+
+    def on_progress_seek(self, seek_time):
+        """Handle seek events from progress bar"""
+        if not self.temp_files or not self.audio_player.files:
+            return
+            
+        # Get the processed duration (buffered audio)
+        processed_duration = self.audio_player.get_processed_duration()
+        
+        # Calculate maximum safe seek position (15 seconds before processed duration)
+        max_safe_seek = max(0, processed_duration - 15.0)
+        
+        # Clamp the seek position to safe range
+        target_pos = min(seek_time, max_safe_seek)
+        
+        # Store playing state
+        was_playing = self.audio_player.is_playing
+        
+        # Seek to new position
+        self.audio_player.seek(target_pos)
+        
+        # Update progress bar and time labels immediately
+        total_duration = self.audio_player.get_duration()
+        if total_duration > 0:
+            progress = (target_pos / total_duration) * 100
+            self.progress_bar.set_value(progress)
+            self.current_time.text = self.format_time(target_pos)
+            
+        # Show feedback if we hit the safe seek limit
+        if target_pos == max_safe_seek and seek_time > max_safe_seek:
+            self.status_label.text = 'Processing more audio...'
+            Clock.schedule_once(lambda dt: setattr(self.status_label, 'text', 
+                'Playing' if self.is_playing else 'Paused'), 1.5)
+        
+        # Resume if was playing
+        if was_playing:
+            self.audio_player.resume()
+
+    def close_application(self, instance):
+        """Properly close the application"""
+        try:
+            # Stop any playing audio
+            if self.audio_player:
+                self.audio_player.stop()
+            
+            # Cancel any scheduled events
+            if self._update_event:
+                self._update_event.cancel()
+            
+            # Clean up temp files
+            self.cleanup()
+            
+            # Stop pygame mixer
+            pygame.mixer.quit()
+            
+            # Close the application
+            App.get_running_app().stop()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            # Force quit if cleanup fails
+            App.get_running_app().stop()
+
 class MeloTTSApp(App):
     def build(self):
         self.ui = MeloTTSUI()
+        # Bind the close event to the cleanup method
+        Window.bind(on_request_close=self.on_request_close)
         return self.ui
+
+    def on_request_close(self, *args):
+        """Handle window close button click"""
+        self.ui.close_application(None)
+        return True
 
     def on_stop(self):
         """Called when the application is about to close"""
@@ -1107,5 +1512,34 @@ class MeloTTSApp(App):
         pygame.mixer.quit()
 
 if __name__ == '__main__':
+    # --- START: Memory Limiting Code ---
+    import sys
+    # This code only works on Linux and macOS
+    if sys.platform.startswith('linux') or sys.platform == 'darwin':
+        import resource
+
+        def limit_memory(max_bytes):
+            """
+            Set the maximum memory usage for the current process.
+
+            This function is platform-specific and works on Unix-like systems.
+            """
+            try:
+                # Set the soft and hard limits for the address space
+                soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+                print(f"Current memory limits: Soft={soft / 1024**2:.2f}MB, Hard={hard / 1024**2:.2f}MB")
+                resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
+                print(f"New memory limit set to: {max_bytes / 1024**3:.2f}GB")
+            except (ImportError, ValueError, resource.error) as e:
+                print(f"Warning: Could not set memory limit. {e}")
+
+        # Set the memory limit to 2 GB (2 * 1024 * 1024 * 1024 bytes).
+        limit_memory(1 * 1024 * 1024 * 1024)
+
+    else:
+        print("Warning: Memory limiting is not supported on this OS (e.g., Windows).")
+    # --- END: Memory Limiting Code ---
+
+
     print("Make sure you've downloaded unidic (python -m unidic download) for this app to work.")
     MeloTTSApp().run()
